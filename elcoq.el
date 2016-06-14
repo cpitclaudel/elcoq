@@ -35,8 +35,8 @@ Get the value associated to KEY in ALIST, or nil."
   (declare (debug t))
   `(cdr (assq ,key ,alist)))
 
-(defmacro elcoq-alist-put (key alist value)
-  "Set binding of KEY in ALIST to VALUE."
+(defmacro elcoq-alist-put (key value alist)
+  "Set binding of KEY to VALUE in ALIST."
   (declare (debug t))
   `(setcdr (assq ,key ,alist) ,value))
 
@@ -48,19 +48,24 @@ Get the value associated to KEY in ALIST, or nil."
 
 (defun elcoq--sertop-args ()
   "Compute sertop arguments."
-  `("-print0"
+  `("--print0"
     ,@(when elcoq-coq-directory
-        `("-prelude" ,elcoq-coq-directory))))
+        `("--prelude" ,elcoq-coq-directory))))
 
 ;; Alists are nicer to use than defstructs, and extensible.
 
-(defun elcoq--query (query callback)
+(defun elcoq--make-query (sexp callback)
   "Create a query alist.
-QUERY and CALLBACK are stored."
-  `((query . ,query)
+The resulting alist has the following fields:
+- `sexp' (populated from SEXP), a query sexp.
+- `callback' (populated from CALLBACK), a callback to fire when output or events
+  are received for this query.  `callback' it always called in the prover's main
+  buffer.  It should take two arguments: a type of even (one of `output', `ack',
+  `done', or `failed') and optionally the actual output."
+  `((sexp . ,sexp)
     (callback . ,callback)))
 
-(defun elcoq--prover (process buffer)
+(defun elcoq--make-prover (process buffer)
   "Create a prover alist.
 The resulting alist has the following fields:
 - `process' (populated from PROCESS), a process object.
@@ -71,8 +76,6 @@ The resulting alist has the following fields:
 - `queries', a hash of query-id → in-flight query.
 - `tip', state ID of the current tip.
 - `overlays', a hash of state-id → overlay.
-- `in-flight-overlays', a list of overlays that have not been attributed state
-  ids yet, from latest to newest
 - `pending-overlays', a list of overlays that haven't been sent yet.
 - `accumulator', a list of message chunks, in reverse order.
 - `messages', a list of complete messages that haven't been dispatched yet.
@@ -82,15 +85,14 @@ The resulting alist has the following fields:
     (fresh-id . 0)
     (timer . 0)
     (queries . ,(make-hash-table :test 'eq))
-    (tip . nil)
+    (tip . ,(list))
     (overlays . ,(make-hash-table :test 'eq))
-    (in-flight-overlays . nil) ;; TODO could use a queue
-    (pending-overlays . nil) ;; TODO could use a queue
-    (accumulator . nil)
-    (messages . nil)
-    (synchronous-query-id . nil)))
+    (pending-overlays . ,(list)) ;; TODO could use a queue
+    (accumulator . ,(list))
+    (messages . ,(list))
+    (synchronous-query-id . ,(list))))
 
-(defmacro elcoq--with-prover (prover &rest body)
+(defmacro elcoq--with-other-prover (prover &rest body)
   "`let-alist'-bind PROVER, change to its buffer, and run BODY."
   (declare (debug t)
            (indent 1))
@@ -99,6 +101,12 @@ The resulting alist has the following fields:
        (with-current-buffer .buffer
          ,@body))))
 
+(defmacro elcoq--with-prover (&rest body)
+  "`let-alist'-bind PROVER, change to its buffer, and run BODY."
+  (declare (debug t)
+           (indent 0))
+  `(elcoq--with-other-prover elcoq--prover ,@body))
+
 (defvar-local elcoq--prover nil
   "Buffer-local `elcoq--prover' object.
 The same prover may be shared by multiple buffer; for this
@@ -106,13 +114,19 @@ reason, all prover state should be stored in that object.")
 
 (defun elcoq--sertop-fresh-id ()
   "Return a fresh query ID."
-  (1- (cl-incf (elcoq-alist-get 'fresh-id elcoq--prover))))
+  (intern (format "elcoq-%d" (1- (cl-incf (elcoq-alist-get 'fresh-id elcoq--prover))))))
 
 (defun elcoq-running-p ()
   "Check if an instance of sertop is running in current buffer."
   (and elcoq--prover
        (let-alist elcoq--prover
          (process-live-p .process))))
+
+(defun elcoq--sertop-busy ()
+  "Check if sertop is busy."
+  (elcoq--with-prover
+    (or (> (hash-table-count .queries) 0)
+        .synchronous-query-id)))
 
 (defun elcoq--sertop-message-query-id (msg)
   "Read query id of message MSG."
@@ -122,7 +136,7 @@ reason, all prover state should be stored in that object.")
 (defun elcoq--sertop-may-dispatch-id (id)
   "Check if id ID may be dispatched.
 Takes `synchronous-query-id' into account."
-  (elcoq--with-prover elcoq--prover
+  (elcoq--with-prover
     (or (null .synchronous-query-id)
         (eq id .synchronous-query-id))))
 
@@ -131,25 +145,60 @@ Takes `synchronous-query-id' into account."
 Takes `synchronous-query-id' into account."
   (elcoq--sertop-may-dispatch-id (elcoq--sertop-message-query-id msg)))
 
+(defun elcoq--sertop-query-is-control (sexp)
+  "Check whether SEXP is a control query.
+This determines whether QUERY receives a “Completed” message."
+  (eq (car sexp) 'Control))
+
+(defun elcoq--sertop-check-for-completion (answer sexp id)
+  "Update state if ANSWER suggests that query SEXP (with ID) has completed.
+Non-control queries complete after the first response.  Control
+queries complete after a “Completed” signal."
+  (-when-let* ((completed (pcase answer
+                            (`Ack nil)
+                            (`Completed t)
+                            (`(CoqExn ,_) t)
+                            (_ (not (elcoq--sertop-query-is-control sexp))))))
+    (message "Answer %S shows that query %S (%S) is complete." answer sexp id)
+    (elcoq-alist-put 'synchronous-query-id nil elcoq--prover)
+    (remhash id (elcoq-alist-get 'queries elcoq--prover))))
+
+(defun elcoq--sertop-handle-canceled-state (state-id)
+  "Forget about STATE-ID, and remove corresponding overlay."
+  (elcoq--with-prover
+    (message "Canceling state %S" state-id)
+    (-if-let* ((overlay (gethash state-id .overlays)))
+        (progn
+          (remhash state-id .overlays)
+          (delete-overlay overlay))
+      (message "Already canceled: %S" state-id))))
+
 (defun elcoq--sertop-dispatch-answer (answer id)
   "Handle ANSWER to query with id ID."
-  (elcoq--with-prover elcoq--prover
+  (elcoq--with-prover
     (cl-assert (elcoq--sertop-may-dispatch-id id))
-    (let* ((query (gethash id .queries)))
+    (let* ((query (gethash id .queries))
+           (sexp (elcoq-alist-get 'sexp query)))
+      (message "Query %S got answer %S" id answer)
       (unless query
         (error "Invalid query ID %S in response" id))
-      (pcase answer
-        (`Ack (message "Acked %S" id))
-        ;; FIXME decide when to clear the synchronous-query-id, in particular
-        ;; because not all queries get a Completed message.
-        (`Completed (message "Completed %S" id)) ;; FIXME
-        (answer
-         (message "Query %S got answer %S" id answer)
-         (let ((callback (elcoq-alist-get 'callback query)))
-           (unwind-protect
-               (when (functionp callback)
-                 (funcall callback answer)))
-           (elcoq-alist-put 'synchronous-query-id elcoq--prover nil)))))))
+      (let ((callback (elcoq-alist-get 'callback query)))
+        (unwind-protect
+            (pcase answer
+              (`Ack
+               (funcall callback 'ack))
+              (`Completed
+               (funcall callback 'done)
+               (run-with-timer 0 nil #'elcoq--sertop-process-queue (current-buffer)))
+              (`(CoqExn ,errs)
+               (funcall callback 'failed errs))
+              (`(StmCanceled ,state-ids)
+               (mapc #'elcoq--sertop-handle-canceled-state state-ids))
+              (_
+               (if callback
+                   (funcall callback 'output answer)
+                 (message "Unexpected answer with no callback: %S" answer))))
+          (elcoq--sertop-check-for-completion answer sexp id))))))
 
 (defun elcoq--sertop-set-overlay-status (overlay status)
   "Set tracking overlay OVERLAY's status to STATUS."
@@ -157,32 +206,39 @@ Takes `synchronous-query-id' into account."
     (overlay-put overlay 'elcoq--status status)
     (overlay-put overlay 'face
                  `(:background ,(pcase status
-                                  (`Pending "grey")
-                                  (`Sent "brown")
-                                  (`ProcessingIn "blue")
-                                  (`Processed "green"))))))
+                                  (`Pending "#555753")
+                                  (`Sent "orchid")
+                                  (`Identified "mediumorchid")
+                                  (`ProcessingIn "lightslateblue")
+                                  (`Processed "darkslateblue")
+                                  (`Failed "red"))))))
 
 (defun elcoq--sertop-dispatch-feedback (feedback)
   "Dispatch feedback object FEEDBACK, updating overlays as needed."
+  (message "Feedback %S" feedback)
   (pcase feedback
-    (`(Feedback
-       ((id (State ,state))
-        (contents ,contents)
-        (route ,_))) ;; FIXME what is route?
-     (message "Feedback on state %S: %S" state contents)
-     (elcoq--with-prover elcoq--prover
-       (let ((overlay (gethash state .overlays)))
+    (`((id (State ,state-id))
+       (contents ,contents)
+       (route ,_)) ;; FIXME what is route?
+     (elcoq--with-prover
+       (-when-let* ((overlay (gethash state-id .overlays)))
+         (overlay-put overlay 'help-echo (pp-to-string contents))
          (pcase contents
            (`(ProcessingIn ,_)
             (elcoq--sertop-set-overlay-status overlay 'ProcessingIn))
            (`Processed
             (elcoq--sertop-set-overlay-status overlay 'Processed))
+           (`(ErrorMsg ,details ,message)
+            ;; `details' has `fname', `line_nb', `bol_pos', `line_nb_last',
+            ;; `bol_pos_last', `bp', `ep'.
+            (elcoq--sertop-set-overlay-status overlay 'Failed)
+            (overlay-put overlay 'after-string message))
            (other
             (message "Unrecognized feedback contents %S" other))))))))
 
 (defun elcoq--sertop-dispatch-1 (msg)
   "Dispatch message MSG."
-  (elcoq--with-prover elcoq--prover
+  (elcoq--with-prover
     (pcase msg
       (`(Feedback ,feedback) (elcoq--sertop-dispatch-feedback feedback))
       (`(Answer ,tag ,answer) (elcoq--sertop-dispatch-answer answer tag))
@@ -191,14 +247,14 @@ Takes `synchronous-query-id' into account."
 (defun elcoq--sertop-dispatch (prover)
   "Dispatch messages in PROVER.
 All messages are dispatched, unless
-`.sertop-synchronous-query-id' is set.  In that case, only
+`.synchronous-query-id' is set.  In that case, only
 the relevant messages are dispatched, and a timer is set to
 re-run this function."
   ;; FIXME decide what to do with Feedback messages
-  (elcoq--with-prover prover
-    (message "Synchronous query is %S\nDispatching %S"
-             .sertop-synchronous-query-id
-             (pp-to-string .messages))
+  (elcoq--with-other-prover prover
+    (message "Synchronous query is %S\nDispatching %S elements"
+             .synchronous-query-id
+             (length .messages))
     (when (process-live-p .process)
       (let ((dispatchable-messages nil)
             (leftover-messages nil))
@@ -206,23 +262,24 @@ re-run this function."
           (if (elcoq--sertop-may-dispatch msg)
               (push msg dispatchable-messages)
             (push msg leftover-messages)))
-        (message "May dispatch %s\nMay not dispatch %s"
-                 (pp-to-string dispatchable-messages)
-                 (pp-to-string leftover-messages))
-        (elcoq-alist-put 'messages prover (nreverse leftover-messages))
+        (message "May dispatch %S elements\nMay not dispatch %S elements"
+                 (length dispatchable-messages)
+                 (length leftover-messages))
+        (setq leftover-messages (nreverse leftover-messages))
+        (elcoq-alist-put 'messages leftover-messages prover)
         (mapc #'elcoq--sertop-dispatch-1 dispatchable-messages)
-        (message "Remaining messages: %S" (elcoq-alist-get 'messages prover))
+        (message "%S messages remain" (length leftover-messages))
         (when (and nil leftover-messages) ;; FIXME
           ;; FIXME reset to 0
-          (elcoq-alist-put 'timer prover (run-with-idle-timer 1 nil #'elcoq--sertop-dispatch prover)))))))
+          (elcoq-alist-put 'timer (run-with-idle-timer 1 nil #'elcoq--sertop-dispatch prover) prover))))))
 
 (defun elcoq--sertop-filter (proc string)
   "Accumulate PROC's output STRING, and act on full responses."
   ;; FIXME handle dead buffer case
-  (message "Filter got %S" string)
+  (message "Filter got %S" (truncate-string-to-width string 80 nil nil "..."))
   (-when-let* ((buf (process-get proc 'elcoq--buffer))
                (prover (buffer-local-value 'elcoq--prover buf)))
-    (elcoq--with-prover prover
+    (elcoq--with-other-prover prover
       (let ((parts (split-string string "\0" nil)))
         (while (consp (cdr parts))
           (push (pop parts) .accumulator)
@@ -231,52 +288,66 @@ re-run this function."
           (setq .accumulator nil))
         (push (car parts) .accumulator)
         ;; Save back into prover object
-        (elcoq-alist-put 'accumulator prover .accumulator)
-        (elcoq-alist-put 'messages prover .messages))
+        (elcoq-alist-put 'accumulator .accumulator prover)
+        (elcoq-alist-put 'messages .messages prover))
       (elcoq--sertop-dispatch prover))))
 
 (defun elcoq--sertop-start ()
   "Start a new sertop.
 Does not kill existing instances.  Use `elcoq-run' for that."
   ;; FIXME Disallow in goal and response.
-  (let ((proc (apply #'start-process "coq" nil
-                     elcoq-sertop-path (elcoq--sertop-args))))
+  (let* ((process-connection-type nil)
+         (proc (apply #'start-process "coq" nil
+                      elcoq-sertop-path (elcoq--sertop-args))))
     (process-put proc 'elcoq--buffer (current-buffer))
     (set-process-filter proc #'elcoq--sertop-filter)
-    (setq elcoq--prover (elcoq--prover proc (current-buffer)))))
+    (setq elcoq--prover (elcoq--make-prover proc (current-buffer)))))
 
 (defun elcoq--sertop-ensure ()
   "Ensure that an instance of sertop is running in current buffer."
   (unless (elcoq-running-p)
     (elcoq--sertop-start)))
 
+(defun prin1-to-sexp (val)
+  "Convert VAL to a sexp.
+Crucially, renders nil as (), not nil."
+  (if (listp val)
+      (concat "(" (mapconcat #'prin1-to-sexp val " ") ")")
+    (prin1-to-string val)))
+
 (defun elcoq--sertop-query (sexp callback)
   "Run query SEXP in current buffer, calling CALLBACK on the result.
 Return the query's ID."
   (elcoq--sertop-ensure)
   (let* ((id (elcoq--sertop-fresh-id))
-         (query-string (prin1-to-string (list id sexp))))
-    (elcoq--with-prover elcoq--prover
-      (message "Sending %S" query-string)
-      (puthash id (elcoq--query sexp callback) .queries)
+         (full-sexp (list id sexp))
+         (query-string (let ((print-escape-newlines t))
+                         (prin1-to-sexp full-sexp))))
+    (elcoq--with-prover
+      (message "Sending %s" query-string)
+      (puthash id (elcoq--make-query sexp callback) .queries)
       (process-send-string .process query-string)
       (process-send-string .process "\n")
       id)))
 
 (defun elcoq--sertop-query-synchronously (sexp)
   "Run query SEXP synchronously in current buffer."
-  (elcoq--with-prover elcoq--prover
+  (elcoq--sertop-ensure)
+  (elcoq--with-prover
     (cl-assert (null .synchronous-query-id))
     (let* ((response nil)
-           (callback (lambda (resp)
-                       (message "Callback fired with %S" resp)
-                       (setq response resp)))
+           (callback (lambda (status &optional output)
+                       (when (eq status 'output)
+                         (setq response output))))
            (id (elcoq--sertop-query sexp callback)))
-      (elcoq-alist-put 'synchronous-query-id elcoq--prover id)
+      (message "Synchronous query %S starting" sexp)
+      (elcoq-alist-put 'synchronous-query-id id elcoq--prover)
       (while (elcoq-alist-get 'synchronous-query-id elcoq--prover)
         ;; Wait until query is done processing
-        (accept-process-output))
+        ;; Passing “1” ensures that timers are not run
+        (accept-process-output .process nil nil 1))
       (cl-assert response)
+      (message "Synchronous query %S completed" sexp)
       response)))
 
 (defun elcoq-run ()
@@ -288,21 +359,28 @@ If needed, kill the existing sertop process."
 
 (defun elcoq--sertop-kill-process ()
   "Kill sertop process."
-  (elcoq--with-prover elcoq--prover
+  (elcoq--with-prover
     (set-process-filter .process #'ignore)
     (when (process-live-p .process)
-      (kill-process .process))
+      (delete-process .process)
+      (accept-process-output))
     (let ((timer (elcoq-alist-get 'timer elcoq--prover)))
       (when (timerp timer)
         (cancel-timer timer)))
     (setq elcoq--prover nil)))
 
+(defun elcoq--is-elcoq-overlay (ov)
+  "Check if OV is an elcoq overlay."
+  (overlay-get ov 'elcoq--status))
+
 (defun elcoq--remove-overlays ()
-  "Remove all elcoq overlays in current buffer."
+  "Remove all elcoq overlays in current buffer.
+Does not interact with the prover; only safe if there is no
+sertop running."
   (save-restriction
     (widen)
     (dolist (ov (overlays-in (point-min) (point-max)))
-      (when (overlay-get ov 'elcoq--status)
+      (when (elcoq--is-elcoq-overlay ov)
         (delete-overlay ov)))))
 
 (defun elcoq-kill ()
@@ -315,42 +393,183 @@ If needed, kill the existing sertop process."
   "Construct an StmState query."
   `(Control StmState))
 
+(defun elcoq--queries-StmCancel (state-ids)
+  "Construct an StmCancel query for states STATE-IDS."
+  `(Control (StmCancel ,state-ids)))
+
+(defun elcoq--queries-StmAdd (overlay)
+  "Construct an StmAdd query for contents of OVERLAY."
+  (elcoq--with-prover
+    (let ((str (buffer-substring-no-properties
+                (overlay-start overlay)
+                (overlay-end overlay))))
+      `(Control (StmAdd
+                 1
+                 ,\.tip ;; FIXME this shouldn't always be TIP
+                 ,str)))))
+
+(defun elcoq--queries-StmObserve (state-id)
+  "Construct an StmObserve query for STATE-ID."
+  `(Control (StmObserve ,state-id)))
+
+(defun elcoq--queries-Goals ()
+  "Construct an Goals query."
+  `(Query (() None PpStr) Goals))
+
+(defun elcoq--sertop-update-tip (response)
+  "Update tip based on StmInfo RESPONSE.
+Return new tip if found, or nil."
+  (pcase response
+    ((or `(StmAdded ,tip ,_ ,_)
+         `(StmCurId ,tip))
+     (message "Updating tip to %S" tip)
+     (elcoq-alist-put 'tip tip elcoq--prover))))
+
 (defun elcoq--sertop-ensure-tip (&optional force)
   "Ensure that tip is known.
 With FORCE, refresh by querying sertop."
-  (elcoq--with-prover elcoq--prover
+  (elcoq--sertop-ensure)
+  (elcoq--with-prover
+    (message "Ensuring tip; current is %S, prover is %S" .tip elcoq--prover)
     (unless (and .tip (not force))
-      (let ((resp (elcoq--sertop-query-synchronously (elcoq--queries-StmState))))
-        (pcase resp
-          (`(StmInfo ,tip ())
-           (elcoq-alist-put 'tip elcoq--prover tip))
-          (_ (error "Unexpected answer %S" resp)))))))
+      (let ((response (elcoq--sertop-query-synchronously (elcoq--queries-StmState))))
+        (unless (elcoq--sertop-update-tip response)
+          (error "Unexpected answer %S" response))))))
+
+(defun elcoq--sertop-overlay-callback (overlay status &optional output)
+  "Update OVERLAY based on STATUS and OUTPUT."
+  (when (eq status 'output)
+    (let ((id (elcoq--sertop-update-tip output)))
+      (unless id
+        (error "Overlay callback: Unexpected answer %S" output))
+      (message "Mapping id %S to overlay %S" id overlay)
+      (overlay-put overlay 'elcoq--state-id id)
+      (elcoq--sertop-set-overlay-status overlay 'Identified)
+      (puthash id overlay (elcoq-alist-get 'overlays elcoq--prover)))))
+
+(defun elcoq--prover-update-goals (status &optional _)
+  "Synchronously update goals if STATUS is `done'."
+  ;; FIXME should this check if the prover is available (ideally in the future
+  ;; this query will be asynchronous).
+  (when (eq status 'done)
+    (let ((response (elcoq--sertop-query-synchronously (elcoq--queries-Goals))))
+      (pcase response
+        (`(ObjList ,goals)
+         (let-alist (elcoq-buffers)
+           (with-current-buffer .goals
+             (let ((inhibit-read-only))
+               (erase-buffer)
+               (dolist (goal goals)
+                 (pcase goal
+                   (`(CoqString ,str)
+                    (insert str))))))))))))
+
+(defun elcoq--sertop-observe ()
+  "If no overlays are pending and the prover isn't busy, observe tip state."
+  (interactive) ;; FIXME remove
+  (elcoq--with-prover
+    (unless (or (elcoq--sertop-busy) (null .tip) .pending-overlays)
+      (elcoq--sertop-query (elcoq--queries-StmObserve .tip) #'elcoq--prover-update-goals))))
+
+(defun elcoq--cancel-state (state-id)
+  "Send an “StmCancel” for STATE-ID and remove it from .overlays."
+  (elcoq--with-prover
+    (let ((sexp (elcoq--queries-StmCancel (list state-id))))
+      (elcoq--sertop-query sexp #'ignore)
+      (remhash state-id .overlays))))
+
+(defun elcoq--remove-pending-overlay (overlay)
+  "Remove OVERLAY from pending overlays list."
+  (elcoq--with-prover
+    (elcoq-alist-put 'pending-overlays (delete overlay .pending-overlays) elcoq--prover)))
+
+(defun elcoq--edit-in-overlay (overlay)
+  "Remove OVERLAY, sending an “StmCancel” message if needed.
+This clears all references to OVERLAY held in internal data structures."
+  ;; FIXME what happens if overlay was sent but not yet numbered and needs to
+  ;; be removed? → Must be locked (this bit could be removed by changing the
+  ;; semantics of StmAdd)
+  (when (elcoq--is-elcoq-overlay overlay)
+    (-if-let* ((state-id (overlay-get overlay 'elcoq--state-id)))
+        (elcoq--cancel-state state-id)
+      (elcoq--remove-pending-overlay overlay))
+    (delete-overlay overlay)))
+
+(defun elcoq--edit-at-point (&optional pos)
+  "Remove overlays at POS (default: point), sending appropriate messages."
+  (dolist (ov (overlays-at (or pos (point))))
+    (elcoq--edit-in-overlay ov)))
+
+(defun elcoq--sertop-send-one ()
+  "Send contents of first pending overlay to prover."
+  (elcoq--sertop-ensure-tip)
+  (elcoq--with-prover
+    (-when-let* ((ov (car .pending-overlays)))
+      (elcoq-alist-put 'pending-overlays (cdr .pending-overlays) elcoq--prover)
+      (elcoq--sertop-set-overlay-status ov 'Sent)
+      (elcoq--sertop-query (elcoq--queries-StmAdd ov)
+                      (apply-partially #'elcoq--sertop-overlay-callback ov)))))
+
+(defun elcoq--sertop-process-queue (&optional buffer)
+  "Process first pending overlay in BUFFER."
+  (setq buffer (or buffer (current-buffer)))
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (elcoq--with-prover
+        (unless (elcoq--sertop-busy)
+          (elcoq--sertop-send-one))))))
+
+(defun elcoq--first-uncovered-point (pos) ;; FIXME implement retraction as well
+  "Find first point before POS not covered by an elcoq overlay."
+  (->> (overlays-in 1 pos) ;; FIXME (1- pos)?
+       (-filter #'elcoq--is-elcoq-overlay)
+       (mapcar #'overlay-end)
+       (apply #'max 1)))
+
+(defun elcoq--queue-area (beg end)
+  "Queue BEG .. END as a single sentence."
+  (let ((ov (make-overlay beg end)))
+    (elcoq--sertop-set-overlay-status ov 'Pending)
+    ov))
+
+(defun elcoq--queue-sentences (beg end)
+  "Queue sentences in BEG .. END."
+  (save-excursion
+    (save-restriction
+      (narrow-to-region beg end)
+      (goto-char (point-min))
+      (let ((overlays nil)
+            (ov-beg (point)))
+        (while (re-search-forward "\\.\\(\\s-\\|$\\)" nil t)
+          (skip-syntax-backward "-")
+          (push (elcoq--queue-area ov-beg (point)) overlays)
+          (setq ov-beg (point)))
+        overlays))))
 
 (defun elcoq-queue-up-to (pos)
   "Queue sentences up to POS (interactively, up to point) ."
   (interactive "d")
   (elcoq--sertop-ensure)
-  (let ((ov (make-overlay 1 pos nil)))
-    (elcoq--sertop-set-overlay-status ov 'Pending)
-    (elcoq-alist-put 'pending-overlays elcoq--prover
-                (append
-                 (elcoq-alist-get 'pending-overlays elcoq--prover)
-                 (list ov)))))
+  (let* ((beg (elcoq--first-uncovered-point pos))
+         (pending (append (elcoq-alist-get 'pending-overlays elcoq--prover)
+                          (nreverse (elcoq--queue-sentences beg pos)))))
+    (elcoq-alist-put 'pending-overlays pending elcoq--prover))
+  (elcoq--sertop-process-queue))
 
 (defun elcoq-buffers ()
   "Return a list of goal and response buffers, creating them if needed."
-  (list (get-buffer-create "*Goal*")
-        (get-buffer-create "*Response*")))
+  `((goals . ,(get-buffer-create "*Goal*"))
+    (response . ,(get-buffer-create "*Response*"))))
 
 (defun elcoq-layout ()
   "Layout windows of current frame."
   (interactive)
   (delete-other-windows)
   (with-selected-window (split-window-horizontally)
-    (pcase-let ((`(,goalw ,respw) (elcoq-buffers)))
-      (switch-to-buffer goalw)
+    (let-alist (elcoq-buffers)
+      (switch-to-buffer .goals)
       (with-selected-window (split-window)
-        (switch-to-buffer respw)))))
+        (switch-to-buffer .response)))))
 
 (defvar elcoq--debug nil)
 
