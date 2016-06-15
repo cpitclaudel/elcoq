@@ -1,0 +1,3 @@
+[submodule "sertop"]
+	path = sertop
+	url = git://github.com/ejgallego/coq-serapi.git

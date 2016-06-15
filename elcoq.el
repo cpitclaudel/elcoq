@@ -40,8 +40,10 @@ Get the value associated to KEY in ALIST, or nil."
   (declare (debug t))
   `(setcdr (assq ,key ,alist) ,value))
 
-(defvar elcoq-sertop-path "/build/coq-serapi/sertop.native"
-  "Path to sertop.")
+(defconst elcoq--directory
+  (file-name-directory (or (and load-in-progress load-file-name)
+                           (bound-and-true-p byte-compile-current-file)
+                           buffer-file-name)))
 
 (defvar elcoq-coq-directory "/build/coq/"
   "Location of the directory containing Coq's sources, or nil.")
@@ -312,7 +314,8 @@ Does not kill existing instances.  Use `elcoq-run' for that."
   ;; FIXME Disallow in goal and response.
   (let* ((process-connection-type nil)
          (proc (apply #'start-process "coq" nil
-                      elcoq-sertop-path (elcoq--sertop-args))))
+                      (expand-file-name "sertop/sertop.native" elcoq--directory)
+                      (elcoq--sertop-args))))
     (process-put proc 'elcoq--buffer (current-buffer))
     (set-process-filter proc #'elcoq--sertop-filter)
     (setq elcoq--prover (elcoq--make-prover proc (current-buffer)))))
