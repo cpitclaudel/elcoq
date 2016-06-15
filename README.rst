@@ -2,6 +2,8 @@
  SerAPI in Emacs
 =================
 
+.. image:: screenshot.png
+
 This is an experimental prototype using @ejgallego's SerAPI in Emacs.  Useful as an experimentation platform, with hope of merging parts of this into Proof General.
 
 Setting up
