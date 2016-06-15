@@ -27,7 +27,7 @@ Using it
 
 - Open the ``test.v`` file.
 
-- Use ``M-x elcoq-run`` to start SerTOP.
+- Use ``M-x elcoq-run`` to start SerTOP (you can also use this to reset it to a clean state).
 
 - Go to the end and use ``M-x coq-queue-up-to`` to add sentences.
 
