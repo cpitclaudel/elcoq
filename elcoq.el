@@ -51,7 +51,12 @@ Get the value associated to KEY in ALIST, or nil."
 
 (defun elcoq--sertop-args ()
   "Compute sertop arguments."
-  `("--print0" ,@(when elcoq-async '("--async"))
+  `("--print0"
+    ,@(when elcoq-async
+        `("--async" ,(file-truename
+                      (if elcoq-coq-directory
+                          (expand-file-name "bin/coqtop" elcoq-coq-directory)
+                        (executable-find "coqtop")))))
     ,@(when elcoq-coq-directory
         `("--prelude" ,elcoq-coq-directory))))
 
@@ -174,6 +179,12 @@ queries complete after a “Completed” signal."
           (delete-overlay overlay))
       (message "Already canceled: %S" state-id))))
 
+(defun elcoq--sertop-may-be-outdated (answer)
+  "Check whether ANSWER refering to an outdated state is OK.
+This is useful because “Canceled” messages for outdated states
+are fine to ignore."
+  (eq (car-safe answer) 'StmCanceled))
+
 (defun elcoq--sertop-dispatch-answer (answer id)
   "Handle ANSWER to query with id ID."
   (elcoq--with-prover
@@ -181,7 +192,7 @@ queries complete after a “Completed” signal."
     (let* ((query (gethash id .queries))
            (sexp (elcoq-alist-get 'sexp query)))
       (message "Query %S got answer %S" id answer)
-      (unless query
+      (unless (or query (elcoq--sertop-may-be-outdated answer))
         (error "Invalid query ID %S in response" id))
       (let ((callback (elcoq-alist-get 'callback query)))
         (unwind-protect
@@ -204,6 +215,7 @@ queries complete after a “Completed” signal."
 (defun elcoq--sertop-set-overlay-status (overlay status)
   "Set tracking overlay OVERLAY's status to STATUS."
   (when overlay
+    (message "Setting status of %S to %S" overlay status)
     (overlay-put overlay 'elcoq--status status)
     (overlay-put overlay 'face
                  `(:background ,(pcase status
@@ -229,13 +241,14 @@ queries complete after a “Completed” signal."
             (elcoq--sertop-set-overlay-status overlay 'ProcessingIn))
            (`Processed
             (elcoq--sertop-set-overlay-status overlay 'Processed))
-           (`(ErrorMsg ,details ,message)
+           (`(ErrorMsg ,_details ,message)
             ;; `details' has `fname', `line_nb', `bol_pos', `line_nb_last',
             ;; `bol_pos_last', `bp', `ep'.
             (elcoq--sertop-set-overlay-status overlay 'Failed)
             (overlay-put overlay 'after-string (format "\n%s\n" message)))
            (other
-            (message "Unrecognized feedback contents %S" other))))))))
+            (message "Unrecognized feedback contents %S" other))))))
+    (_ (message "Unrecognized feedback format %S" feedback))))
 
 (defun elcoq--sertop-dispatch-1 (msg)
   "Dispatch message MSG."
@@ -457,7 +470,7 @@ sertop running."
   (interactive (list (elcoq--previous-state (point)))) ;; FIXME don't be interactive
   (elcoq--with-prover
     (unless (or (elcoq--sertop-busy) .pending-overlays)
-      (elcoq--sertop-query (elcoq--queries-StmObserve state-id) #'elcoq--prover-update-goals))))
+      (elcoq--sertop-query (elcoq--queries-StmObserve state-id) #'ignore)))) ;; elcoq--prover-update-goals
 
 (defun elcoq--cancel-state (state-id)
   "Send an “StmCancel” for STATE-ID and remove it from .overlays."
