@@ -6,6 +6,8 @@
 
 This is an experimental prototype using @ejgallego's SerAPI in Emacs.  Useful as an experimentation platform, with hope of merging parts of this into Proof General.
 
+Video demo: https://asciinema.org/a/b84ph360841x3c9lwq6pyihm9
+
 Setting up
 ==========
 
