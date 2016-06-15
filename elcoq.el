@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'dash)
+(require 'comint)
 (require 'cl-lib)
 
 (defmacro elcoq-alist-get (key alist)
@@ -50,6 +51,9 @@ Get the value associated to KEY in ALIST, or nil."
 
 (defvar elcoq-async t
   "Whether to run sertop in async mode.")
+
+(defvar elcoq-show-debug t
+  "Whether to show the log buffer.")
 
 (defun elcoq--sertop-args ()
   "Compute sertop arguments."
@@ -289,6 +293,27 @@ re-run this function."
           ;; FIXME reset to 0
           (elcoq-alist-put 'timer (run-with-idle-timer 1 nil #'elcoq--sertop-dispatch prover) prover))))))
 
+(defun elcoq--sertop-format (indent response)
+  "Return a pretty-printed, optionally INDENT'ed copy of RESPONSE."
+  (let ((pped (pp-to-string response)))
+    (if indent
+        (replace-regexp-in-string
+         "^\\(.\\)" "  \\1" pped t)
+      pped)))
+
+(defun elcoq--sertop-log (proc messages &optional indent)
+  "Log parsed output from PROC.
+MESSAGES is a list of messages in reverse order.  If INDENT is
+non-nil, messages are idented away from the left margin."
+  (let ((proc-buf (process-buffer proc)))
+    (when (buffer-live-p proc-buf)
+      (with-current-buffer proc-buf
+        (save-excursion
+          (goto-char (process-mark proc))
+          (insert (mapconcat (apply-partially #'elcoq--sertop-format indent)
+                             (reverse messages) ""))
+          (set-marker (process-mark proc) (point)))))))
+
 (defun elcoq--sertop-filter (proc string)
   "Accumulate PROC's output STRING, and act on full responses."
   ;; FIXME handle dead buffer case
@@ -296,26 +321,49 @@ re-run this function."
   (-when-let* ((buf (process-get proc 'elcoq--buffer))
                (prover (buffer-local-value 'elcoq--prover buf)))
     (elcoq--with-other-prover prover
-      (let ((parts (split-string string "\0" nil)))
+      (let ((parts (split-string string "\0" nil))
+            (new-messages nil))
         (while (consp (cdr parts))
           (push (pop parts) .accumulator)
           (let ((msg-string (apply #'concat (nreverse .accumulator))))
-            (push (read msg-string) .messages))
+            (push (read msg-string) new-messages))
           (setq .accumulator nil))
         (push (car parts) .accumulator)
         ;; Save back into prover object
         (elcoq-alist-put 'accumulator .accumulator prover)
-        (elcoq-alist-put 'messages .messages prover))
+        (elcoq-alist-put 'messages (nconc new-messages .messages) prover)
+        ;; Log
+        (elcoq--sertop-log proc new-messages t))
       (elcoq--sertop-dispatch prover))))
+
+(defconst elcoq--sertop-font-lock-keywords
+  '(("([A-Z]\\(\\w\\|\\s_\\|\\\\.\\)+\\(\\s-\\|\n\\)" . font-lock-function-name-face)
+    ("(\\(\\w\\|\\s_\\|\\\\.\\)+\\(\\s-\\|\n\\)" . font-lock-variable-name-face)
+    ("\\_<nil\\_>" . font-lock-builtin-face))
+  "Font lock pairs for `elcoq--sertop-mode'.")
+
+(defvar sertop-mode-syntax-table lisp-mode-syntax-table
+  "Syntax table for `elcoq--sertop-mode'.")
+
+(define-derived-mode elcoq--sertop-mode comint-mode "Sertop"
+  "Major mode for interacting with Sertop."
+  (setq comint-process-echoes nil)
+  (setq comint-use-prompt-regexp nil)
+  (setq font-lock-defaults '(elcoq--sertop-font-lock-keywords))
+  (when (fboundp 'rainbow-delimiters-mode) (rainbow-delimiters-mode)))
 
 (defun elcoq--sertop-start ()
   "Start a new sertop.
 Does not kill existing instances.  Use `elcoq-run' for that."
   ;; FIXME Disallow in goal and response.
   (let* ((process-connection-type nil)
-         (proc (apply #'start-process "coq" nil
+         (proc-buf (get-buffer-create (generate-new-buffer-name "*Sertop*")))
+         (proc (apply #'start-process "coq" proc-buf
                       (expand-file-name "sertop/sertop.native" elcoq--directory)
                       (elcoq--sertop-args))))
+    (with-current-buffer proc-buf
+      (elcoq--sertop-mode)
+      (display-buffer (current-buffer)))
     (process-put proc 'elcoq--buffer (current-buffer))
     (set-process-filter proc #'elcoq--sertop-filter)
     (setq elcoq--prover (elcoq--make-prover proc (current-buffer)))))
@@ -342,6 +390,7 @@ Return the query's ID."
                          (prin1-to-sexp full-sexp))))
     (elcoq--with-prover
       (message "Sending %s" query-string)
+      (elcoq--sertop-log .process (list full-sexp))
       (puthash id (elcoq--make-query sexp callback) .queries)
       (process-send-string .process query-string)
       (process-send-string .process "\n")
@@ -381,6 +430,9 @@ If needed, kill the existing sertop process."
     (when (process-live-p .process)
       (delete-process .process)
       (accept-process-output))
+    (let ((proc-buf (process-buffer .process)))
+      (when (buffer-live-p proc-buf)
+        (kill-buffer proc-buf)))
     (let ((timer (elcoq-alist-get 'timer elcoq--prover)))
       (when (timerp timer)
         (cancel-timer timer)))
