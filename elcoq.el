@@ -46,9 +46,12 @@ Get the value associated to KEY in ALIST, or nil."
 (defvar elcoq-coq-directory "/build/coq/"
   "Location of the directory containing Coq's sources, or nil.")
 
+(defvar elcoq-async t
+  "Whether to run sertop in async mode.")
+
 (defun elcoq--sertop-args ()
   "Compute sertop arguments."
-  `("--print0"
+  `("--print0" ,@(when elcoq-async '("--async"))
     ,@(when elcoq-coq-directory
         `("--prelude" ,elcoq-coq-directory))))
 
@@ -74,7 +77,6 @@ The resulting alist has the following fields:
 - `timer', a timer used to re-fire the dispatching event after running a
   synchronous query.
 - `queries', a hash of query-id → in-flight query.
-- `tip', state ID of the current tip.
 - `overlays', a hash of state-id → overlay.
 - `pending-overlays', a list of overlays that haven't been sent yet.
 - `accumulator', a list of message chunks, in reverse order.
@@ -85,7 +87,6 @@ The resulting alist has the following fields:
     (fresh-id . 0)
     (timer . 0)
     (queries . ,(make-hash-table :test 'eq))
-    (tip . ,(list))
     (overlays . ,(make-hash-table :test 'eq))
     (pending-overlays . ,(list)) ;; TODO could use a queue
     (accumulator . ,(list))
@@ -232,7 +233,7 @@ queries complete after a “Completed” signal."
             ;; `details' has `fname', `line_nb', `bol_pos', `line_nb_last',
             ;; `bol_pos_last', `bp', `ep'.
             (elcoq--sertop-set-overlay-status overlay 'Failed)
-            (overlay-put overlay 'after-string message))
+            (overlay-put overlay 'after-string (format "\n%s\n" message)))
            (other
             (message "Unrecognized feedback contents %S" other))))))))
 
@@ -397,15 +398,15 @@ sertop running."
   "Construct an StmCancel query for states STATE-IDS."
   `(Control (StmCancel ,state-ids)))
 
-(defun elcoq--queries-StmAdd (overlay)
-  "Construct an StmAdd query for contents of OVERLAY."
+(defun elcoq--queries-StmAdd (overlay previous-state)
+  "Construct an StmAdd query to add text in OVERLAY to PREVIOUS-STATE."
   (elcoq--with-prover
     (let ((str (buffer-substring-no-properties
                 (overlay-start overlay)
                 (overlay-end overlay))))
       `(Control (StmAdd
-                 1
-                 ,\.tip ;; FIXME this shouldn't always be TIP
+                 1 ;; Just one sentence for now
+                 ,(if previous-state `(Some ,previous-state) `None)
                  ,str)))))
 
 (defun elcoq--queries-StmObserve (state-id)
@@ -416,30 +417,17 @@ sertop running."
   "Construct an Goals query."
   `(Query (() None PpStr) Goals))
 
-(defun elcoq--sertop-update-tip (response)
-  "Update tip based on StmInfo RESPONSE.
-Return new tip if found, or nil."
+(defun elcoq--sertop-read-state-id (response)
+  "Read state id from RESPONSE."
   (pcase response
-    ((or `(StmAdded ,tip ,_ ,_)
-         `(StmCurId ,tip))
-     (message "Updating tip to %S" tip)
-     (elcoq-alist-put 'tip tip elcoq--prover))))
-
-(defun elcoq--sertop-ensure-tip (&optional force)
-  "Ensure that tip is known.
-With FORCE, refresh by querying sertop."
-  (elcoq--sertop-ensure)
-  (elcoq--with-prover
-    (message "Ensuring tip; current is %S, prover is %S" .tip elcoq--prover)
-    (unless (and .tip (not force))
-      (let ((response (elcoq--sertop-query-synchronously (elcoq--queries-StmState))))
-        (unless (elcoq--sertop-update-tip response)
-          (error "Unexpected answer %S" response))))))
+    ((or `(StmAdded ,state-id ,_ ,_)
+         `(StmCurId ,state-id)) ;; FIXME remove StmCurId
+     state-id)))
 
 (defun elcoq--sertop-overlay-callback (overlay status &optional output)
   "Update OVERLAY based on STATUS and OUTPUT."
   (when (eq status 'output)
-    (let ((id (elcoq--sertop-update-tip output)))
+    (let ((id (elcoq--sertop-read-state-id output)))
       (unless id
         (error "Overlay callback: Unexpected answer %S" output))
       (message "Mapping id %S to overlay %S" id overlay)
@@ -464,12 +452,12 @@ With FORCE, refresh by querying sertop."
                    (`(CoqString ,str)
                     (insert str))))))))))))
 
-(defun elcoq--sertop-observe ()
-  "If no overlays are pending and the prover isn't busy, observe tip state."
-  (interactive) ;; FIXME remove
+(defun elcoq--sertop-observe (state-id)
+  "If no overlays are pending and the prover isn't busy, observe STATE-ID."
+  (interactive (list (elcoq--previous-state (point)))) ;; FIXME don't be interactive
   (elcoq--with-prover
-    (unless (or (elcoq--sertop-busy) (null .tip) .pending-overlays)
-      (elcoq--sertop-query (elcoq--queries-StmObserve .tip) #'elcoq--prover-update-goals))))
+    (unless (or (elcoq--sertop-busy) .pending-overlays)
+      (elcoq--sertop-query (elcoq--queries-StmObserve state-id) #'elcoq--prover-update-goals))))
 
 (defun elcoq--cancel-state (state-id)
   "Send an “StmCancel” for STATE-ID and remove it from .overlays."
@@ -500,14 +488,27 @@ This clears all references to OVERLAY held in internal data structures."
   (dolist (ov (overlays-at (or pos (point))))
     (elcoq--edit-in-overlay ov)))
 
+(defun elcoq--state-id-at-pos (pos)
+  "Return state id at position POS."
+  (get-pos-property pos 'elcoq--state-id))
+
+(defun elcoq--previous-state (pos)
+  "Find state id of sentence before POS."
+  (save-restriction
+    (widen) ;; FIXME http://emacs.stackexchange.com/questions/23970/
+    (let ((1-past-sentence-end (previous-single-char-property-change (1+ pos) 'elcoq--state-id)))
+      (when (> 1-past-sentence-end (point-min))
+        (let ((state-id (elcoq--state-id-at-pos (1- 1-past-sentence-end))))
+          (cl-assert state-id nil "Expecting to find a state ID at position %S" pos)
+          state-id)))))
+
 (defun elcoq--sertop-send-one ()
   "Send contents of first pending overlay to prover."
-  (elcoq--sertop-ensure-tip)
   (elcoq--with-prover
     (-when-let* ((ov (car .pending-overlays)))
       (elcoq-alist-put 'pending-overlays (cdr .pending-overlays) elcoq--prover)
       (elcoq--sertop-set-overlay-status ov 'Sent)
-      (elcoq--sertop-query (elcoq--queries-StmAdd ov)
+      (elcoq--sertop-query (elcoq--queries-StmAdd ov (elcoq--previous-state (overlay-start ov)))
                       (apply-partially #'elcoq--sertop-overlay-callback ov)))))
 
 (defun elcoq--sertop-process-queue (&optional buffer)
@@ -526,9 +527,16 @@ This clears all references to OVERLAY held in internal data structures."
        (mapcar #'overlay-end)
        (apply #'max 1)))
 
+(defun elcoq--overlay-modified (overlay _before-p _beg _end &optional _len)
+  "Register modification of overlay OVERLAY.
+BEFORE-P, BEG, END, LEN: see info node `(elisp)Overlay Properties'"
+  (elcoq--edit-in-overlay overlay))
+
 (defun elcoq--queue-area (beg end)
-  "Queue BEG .. END as a single sentence."
+  "Create an overlay identifying BEG .. END as a single sentence."
   (let ((ov (make-overlay beg end)))
+    (overlay-put ov 'modification-hooks '(elcoq--overlay-modified))
+    (overlay-put ov 'insert-in-front-hooks '(elcoq--overlay-modified))
     (elcoq--sertop-set-overlay-status ov 'Pending)
     ov))
 
