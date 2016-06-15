@@ -414,6 +414,10 @@ sertop running."
   "Construct an StmCancel query for states STATE-IDS."
   `(Control (StmCancel ,state-ids)))
 
+(defun elcoq--queries-StmJoin ()
+  "Construct an StmJoin query."
+  `(Control StmJoin))
+
 (defun elcoq--queries-StmAdd (overlay previous-state)
   "Construct an StmAdd query to add text in OVERLAY to PREVIOUS-STATE."
   (elcoq--with-prover
@@ -474,6 +478,13 @@ sertop running."
   (elcoq--with-prover
     (unless (or (elcoq--sertop-busy) .pending-overlays)
       (elcoq--sertop-query (elcoq--queries-StmObserve state-id) #'ignore)))) ;; elcoq--prover-update-goals
+
+(defun elcoq--sertop-join ()
+  "If no overlays are pending and the prover isn't busy, join."
+  (interactive) ;; FIXME don't be interactive
+  (elcoq--with-prover
+    (unless (or (elcoq--sertop-busy) .pending-overlays)
+      (elcoq--sertop-query (elcoq--queries-StmJoin) #'ignore)))) ;; elcoq--prover-update-goals
 
 (defun elcoq--cancel-state (state-id)
   "Send an “StmCancel” for STATE-ID and remove it from .overlays."
