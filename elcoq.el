@@ -522,8 +522,9 @@ This clears all references to OVERLAY held in internal data structures."
 (defun elcoq--previous-state (pos)
   "Find state id of sentence before POS."
   (save-restriction
-    (widen) ;; FIXME http://emacs.stackexchange.com/questions/23970/
-    (let ((1-past-sentence-end (previous-single-char-property-change (1+ pos) 'elcoq--state-id)))
+    (widen)
+    (setq pos (min (1+ pos) (point-max)))
+    (let ((1-past-sentence-end (previous-single-char-property-change pos 'elcoq--state-id)))
       (when (> 1-past-sentence-end (point-min))
         (let ((state-id (elcoq--state-id-at-pos (1- 1-past-sentence-end))))
           (cl-assert state-id nil "Expecting to find a state ID at position %S" pos)
