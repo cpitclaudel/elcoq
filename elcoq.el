@@ -247,11 +247,21 @@ are fine to ignore."
             (elcoq--sertop-set-overlay-status overlay 'ProcessingIn))
            (`Processed
             (elcoq--sertop-set-overlay-status overlay 'Processed))
-           (`(ErrorMsg ,_details ,message)
-            ;; `details' has `fname', `line_nb', `bol_pos', `line_nb_last',
-            ;; `bol_pos_last', `bp', `ep'.
-            (elcoq--sertop-set-overlay-status overlay 'Failed)
-            (overlay-put overlay 'after-string (format "\n%s\n" message)))
+           (`(Message ,level ,_loc ,message)
+            ;; `loc' contains an optional location with fields
+            ;; `fname', `line_nb', `bol_pos', `line_nb_last',
+            ;; `bol_pos_last', `bp', `ep'. (begin-end position)
+
+            ;; `message' is in "richpp" format, which is either `PCData
+            ;; string` or `Element tag nil (list richpp)` a tagged
+            ;; list of richpp.
+            (pcase level
+              (`Error
+               (elcoq--sertop-set-overlay-status overlay 'Failed)
+               (overlay-put overlay 'after-string (format "\n%s\n" message)))
+              (other
+               ;; Warning, Notice, Info, Debug
+               (message "Coq message %S: %S" other message))))
            (other
             (message "Unrecognized feedback contents %S" other))))))
     (_ (message "Unrecognized feedback format %S" feedback))))
@@ -476,9 +486,9 @@ sertop running."
     (let ((str (buffer-substring-no-properties
                 (overlay-start overlay)
                 (overlay-end overlay))))
+      ;; If no previous state, StmAdd will try to do "the right thing".
       `(Control (StmAdd
-                 1 ;; Just one sentence for now
-                 ,(if previous-state `(Some ,previous-state) `None)
+                 ,(if previous-state `((ontop ,previous-state)) () )
                  ,str)))))
 
 (defun elcoq--queries-StmObserve (state-id)
@@ -487,7 +497,7 @@ sertop running."
 
 (defun elcoq--queries-Goals ()
   "Construct an Goals query."
-  `(Query (() None PpStr) Goals))
+  `(Query ((pp ((pp_format PpStr)) )) Goals))
 
 (defun elcoq--sertop-read-state-id (response)
   "Read state id from RESPONSE."
